@@ -1,0 +1,721 @@
+#!/bin/sh
+#############################################################################
+#                      tvbm - Tyk VirtualBox Manager                        #
+# This script is a frontend to VboxManage for managing Virtualbox machines. #
+# The scripts options are fairly self explanatory.                          #
+#                                                                           #
+# More about this script: http://wiki.tyk.nu/index.php?title=Tvbm           #
+# The most recent version of this script can be found in SVN:               #
+# https://svn.tyknet.dk/svn/tykscripts/tvbm                                 #
+# Author: Thomas Steen Rasmussen / Tykling                                  #
+#############################################################################
+# Revision information below:                                               #
+# $Rev:: 17                                     $:  Revision of last commit #
+# $Author:: tykling                             $:  Author of last commit   #
+# $Date:: 2012-02-29 21:31:12 +0100 (on, 29 feb#$:  Date of last commit     #
+#############################################################################
+
+#uncomment this line to debug, generates a _lot_ of output
+#set -x
+
+# No X please
+DISPLAY=""
+
+# pull in config file
+. tvbm.conf
+
+########################### SCRIPT START ####################################
+#this script should be run as root
+if [ `id -u` -ne 0 ]; then
+	echo "ERROR: This script should be run as root, exiting."
+	exit 1
+fi
+
+if [ ! -d $BASEDIR ]; then
+	echo "BASEDIR $BASEDIR doesn't exist, exiting."
+	exit 1
+fi
+
+if [ ! -d $VMDIR ]; then
+	echo "VMDIR $VMDIR doesn't exist, creating..."
+	mkdir $VMDIR
+	chown $VBOXUSER $VMDIR
+fi
+
+if [ ! -d $ISODIR ]; then
+        echo "ISODIR $ISODIR doesn't exist, creating..."
+        mkdir $ISODIR
+	chown $VBOXUSER $VMDIR
+fi
+
+$SU true
+if [ $? -ne 0 ]; then
+	echo "ERROR: Unable to 'su' to user $VBOXUSER, exiting."
+	exit 1
+fi
+
+########################### DEFINE FUNCTIONS ####################################
+usage() {
+        echo "Usage: `basename $0` <command> <name> [options]"
+		echo "Help: `basename $0` help"
+		echo "More help: http://wiki.tyk.nu/index.php?title=Tvbm"
+}
+
+help() {
+	echo "tvbm - Tyk VirtualBox Manager"
+	echo "Usage: `basename $0` command [options]"
+	echo "Where 'command' and options can be:"
+	echo " create <name> [-i isopath] [-r ramsize] [-d disksize] [-v vlan] [-o OS] [-c original] [-q] [-y]"
+	echo "       create a new virtual machine (VNC port will be auto selected and added to name)."
+	echo " list                    list all virtual machines."
+	echo " delete <name>           delete a virtual machine including harddisk - careful with this one."
+	echo " start <name>            start a virtual machine, with VNC console on the VMs designated VNC port."
+	echo " stop <name>             acpi poweroff a VM."
+	echo " kill <name>             hard poweroff a VM."
+	echo " info <name>             show info about a VM."
+	echo " noiso <name>            unmount any ISO from the secondary master drive. 'nocd' is an alias for 'noiso'."
+	echo " help                    this help message."
+	echo "See http://wiki.tyk.nu/index.php?title=Tvbm for more."
+	exit 0
+}
+
+getuuid() {
+	#this function echoes the UUID of a VM with the given name
+	echo `$SU "$VBM list vms" | grep "^\"$1\" {" | cut -d "{" -f 2 | cut -d "}" -f 1`
+}
+
+isrunning() {
+	#this function returns yes if the VM with the given name is running, no if not
+	$SU "$VBM list runningvms" | grep "$NAME" > /dev/null
+	if [ $? -eq 0 ]; then
+		echo "yes"
+	else
+		echo "no"
+	fi
+}
+
+checkzfsstatus() {
+	zfs list > /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		#zfs enabled server
+		for mountpoint in `zfs list | awk '{ print $5 }'`; do
+			if [ $mountpoint = $VMDIR ]; then
+				ZFS=true
+			fi
+		done
+		if [ $ZFS ]; then
+			DATASET=`zfs list | grep " ${VMDIR}$" | cut -d " " -f 1`
+			echo "$VMDIR is a ZFS dataset. A seperate ZFS dataset will be created to contain this VM."
+			if [ -z $AUTOYES ]; then
+				echo "Press enter to create the ZFS dataset and the VM."
+				read tyktemp
+			fi
+			zfs create $DATASET/$DSNAME
+			chown vboxuser:vboxuser $VMDIR/$DSNAME
+		else
+			echo "This server is ZFS enabled but $VMDIR is not a ZFS dataset."
+			if [ -z $AUTOYES ]; then
+				echo "Press enter to create the VM."
+				read tyktemp
+			fi
+		fi
+	else
+		if [ -z $AUTOYES ]; then
+			echo "Press enter to create the VM."
+			read tyktemp
+		fi
+	fi
+}
+
+#find the first available VNC port for use when creating a VM
+getnewvncport() {
+	COUNTER=0
+	while true; do
+		TESTPORT=`expr 5900 + $COUNTER`
+		#check if this port is in use
+		$SU "$VBM list vms | grep '_${TESTPORT}\" ' > /dev/null"
+		if [ $? -eq 1 ]; then
+			#this port is not in use
+			echo $TESTPORT
+			break
+		fi
+		COUNTER=`expr $COUNTER + 1`
+	done
+}
+########################### FUNCTIONS END ####################################
+
+#check for the first command line argument
+if [ ! $1 ]; then
+	usage
+	exit 1
+fi
+
+#get the command line argument
+command=$1
+#remove this argument from the argument list
+shift
+#check the first command line argument
+case "$command" in
+	create|delete|clone|start|stop|kill|info|noiso|nocd)
+		#get the name, quit if no name was supplied
+		if [ ! $1 ]; then
+			echo "No name specified. Error."
+			usage
+			exit 1
+		else
+			#get the name, remove from argument list
+			NAME=$1
+			shift
+		fi
+	;;
+	list|help)
+		#no second option needed for these commands, do nothing here
+	;;
+	*)
+		echo "ERROR: Unknown command $command, bailing out."
+		exit 1
+	;;
+esac
+
+if [ $command = "create" ]; then
+	#handle options if any were supplied
+	while getopts yqi:r:c:d:v:o: opt; do
+		case "$opt" in
+			i) ISOPATH="${OPTARG}" ;;
+			r) USERRAM="${OPTARG}" ;;
+			d) USERDISK="${OPTARG}" ;;
+			v) VLAN="${OPTARG}" ;;
+			o) VOSTYPE="${OPTARG}" ;;
+			c) ORIGINAL="${OPTARG}" ;;
+			y) AUTOYES=YES ;;
+			q) QUIET=YES ;;
+			[?]) usage; exit 1;;
+	esac
+	done
+fi
+
+#handle subcommand
+case "$command" in
+	create)
+		if [ $ORIGINAL  ]; then
+			#if cloning a VM, check if the original VM is running, exit if so
+			RUNNING=`isrunning $ORIGINAL`
+			if [ "$RUNNING" = "yes" ]; then
+				echo "ERROR: The VM with the name $NAME is already running. Please stop it before cloning it."
+				exit 1
+			fi
+		fi
+
+		USEPORT=`getnewvncport`
+		NAME="${NAME}_${USEPORT}"
+		echo "- First available VNC port is $USEPORT - servername will be $NAME"
+		echo ""
+		
+		#find ram size
+		if [ ! $USERRAM ]; then
+			echo -n "Choose the RAM size in MB (enter for default $DEFAULTRAM): "
+			read USERRAM
+			if [ $USERRAM ]; then
+				RAMSIZE=$USERRAM
+			else
+				RAMSIZE=$DEFAULTRAM
+			fi
+		else
+			RAMSIZE=$USERRAM
+		fi
+		#FIX: check that the ram size makes sense
+
+		#if no cloning of an existing VM harddisks has been requested, 
+		#prompt for disk size...
+		if [ ! $ORIGINAL  ]; then
+			if [ ! $USERDISK ]; then
+				echo -n "Enter the harddisk size in MB (enter for default $DEFAULTDISK): "
+				read USERDISK
+				if [ $USERDISK ]; then
+					DISKSIZE=$USERDISK
+				else
+					DISKSIZE=$DEFAULTDISK
+				fi
+			else
+				DISKSIZE=$USERDISK
+			fi
+		else
+			DISKSIZE="Cloned from VM $ORIGINAL"
+		fi
+		#FIX: check that the disksize makes sense here
+		
+		#get ISOPATH
+		if [ ! $ISOPATH ]; then
+			#prompt for ISO selection
+			ISOCOUNT=0
+			TEMPCOUNT=0
+			echo
+			echo "Building a list of available ISO files:"
+			echo "   0: No DVD drive"
+			for ISO in `ls -1 $ISODIR`; do ISOCOUNT=`expr $ISOCOUNT + 1`; echo "   $ISOCOUNT: $ISO"; done
+			echo -n "Please select ISO number: "
+			read ISONUMBER
+			if [ $ISONUMBER -ne 0 ]; then
+				TEMPCOUNT=0
+				for ISO in `ls -1 $ISODIR`; do TEMPCOUNT=`expr $TEMPCOUNT + 1`; if [ $TEMPCOUNT = $ISONUMBER ]; then ISOPATH=$ISODIR/$ISO; ISOFOUND=true; fi; done
+				if [ ! $ISOFOUND ]; then
+					echo "Invalid ISO number, not mounting an ISO."
+					ISOPATH=none
+				else
+					echo "Mounting iso from $ISOPATH ..."
+				fi
+			else
+				echo "Not mounting an ISO."
+				ISOPATH=none
+			fi
+		else
+			#FIX: check if the ISO path is valid here...
+		fi
+
+		#get VLAN
+		if [ ! $VLAN ]; then
+			echo "Building a list of all available VLANS:"
+			VLANCOUNT=0
+			TEMPCOUNT=0
+			echo "   0: No NIC"
+			for VLAN in `ifconfig | grep "^vlan" | cut -d ":" -f 1`; do 
+				VLANCOUNT=`expr $VLANCOUNT + 1`
+				echo "   $VLANCOUNT: $VLAN"
+			done
+			echo -n "Select desired VLAN: "
+			read VLANNUMBER
+			if [ $VLANNUMBER -ne 0 ]; then
+				for VLAN in `ifconfig | grep "^vlan" | cut -d ":" -f 1`; do 
+					TEMPCOUNT=`expr $TEMPCOUNT + 1`
+					if [ $TEMPCOUNT = $VLANNUMBER ]; then
+						NICVLAN=$VLAN
+						VLANFOUND=true
+					fi
+				done
+			else
+				echo "- Not configuring a NIC for this VM."
+			fi
+		else
+			for TMPVLAN in `ifconfig | grep "^vlan" | cut -d ":" -f 1`; do
+				if [ $TMPVLAN = vlan${VLAN} ]; then
+					NICVLAN=vlan${VLAN}
+				fi
+			done
+			if [ ! $NICVLAN ]; then
+				echo "Invalid VLAN specified ($VLAN) - not configuring a NIC for this VM."
+			fi
+		fi
+
+		#GET OS type (if not already specified)
+		if [ ! $VOSTYPE ]; then
+			echo
+			echo "Building a short list of popular operating systems:"
+			echo "   0: Other/Unknown"
+			echo "   1: FreeBSD 32bit"
+			echo "   2: FreeBSD 64bit"
+			echo "   3: Windows 2003 Server 32bit"
+			echo "   4: Windows 2003 Server 64bit"
+			echo "   5: Windows 2008 Server 32bit"
+			echo "   6: Windows 2008 Server 64bit"
+			echo "   7: Windows 7 32bit"
+			echo "   8: Windows 7 64bit"
+			echo -n "Choose OS: "
+			read OSNUMBER
+			case "$OSNUMBER" in
+				0)
+					VOSTYPE=Other
+				;;
+				1)
+					VOSTYPE=FreeBSD
+				;;
+				2)
+					VOSTYPE=FreeBSD_64
+					OS64BIT=true
+				;;
+				3)
+					VOSTYPE=Windows2003
+				;;
+				4)
+					VOSTYPE=Windows2003_64
+					OS64BIT=true
+				;;
+				5)
+					VOSTYPE=Windows2008
+				;;
+				6)
+					VOSTYPE=Windows2008_64
+					OS64BIT=true
+				;;
+				7)
+					VOSTYPE=Windows7
+					OS64BIT=true
+				;;
+				8)
+					VOSTYPE=Windows7_64
+					OS64BIT=true
+				;;
+				*)
+					echo "Invalid option, using Other for OS type."
+					VOSTYPE=Other
+				;;
+			esac
+		else
+			echo $VOSTYPE | grep "_64$" > /dev/null 2>&1
+			if [ $? -eq 0 ]; then
+				#this is a 64bit OS, remember to set IOAPIC
+				OS64BIT=true
+			fi
+		fi
+		
+		############################## READY TO CREATE THE VM ###########################################
+		echo ""
+		echo "== Settings summary =="
+		echo "name: $NAME"
+		echo "Ram (MB): $RAMSIZE"
+		echo "Disk (MB): $DISKSIZE"
+		echo "ISO: $ISOPATH"
+		echo "VLAN: $NICVLAN"
+		echo "OS type: $VOSTYPE"
+		echo ""
+
+		#check and create ZFS dataset where relevant
+		DSNAME=$NAME
+		checkzfsstatus
+		
+		$LOGGER "Creating VM name: $NAME - Ram: $RAMSIZE - Disk: $DISKSIZE - VLAN: $NICVLAN - OS: $VOSTYPE"
+		
+		echo "- Creating the VM named $NAME ..."
+		$SU "$VBM createvm --register --basefolder $VMDIR --name $NAME > /dev/null"
+		if [ $? -ne 0 ]; then
+			echo "Error creating VM, bailing out..."
+			exit 1
+		fi
+
+		#get the UUID
+		UUID=`getuuid $NAME`
+
+		echo "- Setting RAM size ..."
+		$SU "$VBM modifyvm $UUID --memory $RAMSIZE > /dev/null"
+		if [ $? -ne 0 ]; then
+			echo "Error setting VM ram size, bailing out..."
+			exit 1
+		fi
+
+		echo "- Adding SATA controller..."
+		$SU "$VBM storagectl $UUID --name SATACTL --add sata --controller IntelAhci --sataportcount 4 > /dev/null"
+		if [ $? -ne 0 ]; then
+			echo "Error adding SATA controller, bailing out..."
+			exit 1
+		fi
+		
+		echo "- Adding IDE controller..."
+		$SU "$VBM storagectl $UUID --name IDECTL --add ide > /dev/null"
+		if [ $? -ne 0 ]; then
+			echo "Error adding IDE controller, bailing out..."
+			exit 1
+		fi
+		
+		if [ ! $ORIGINAL ]; then
+			echo "- Creating new harddisk..."
+			$SU "$VBM createhd --filename $VMDIR/$NAME/$NAME.vdi --size $DISKSIZE > /dev/null"
+			if [ $? -ne 0 ]; then
+				echo "Error creating harddisk, bailing out..."
+				exit 1
+			fi
+			echo "- Attaching new harddisk to VM..."
+			$SU "$VBM storageattach $UUID --storagectl SATACTL --port 0 --device 0 --type hdd --medium $VMDIR/$NAME/$NAME.vdi > /dev/null"
+			if [ $? -ne 0 ]; then
+				echo "Error attaching harddisk to VM, bailing out..."
+				exit 1
+			fi
+		else
+			#Cloning the harddisks of an existing VM...
+			HDDCOUNT=0
+			for HDUUID in `grep -A 1 'type="HardDisk"' $VMDIR/$ORIGINAL/$ORIGINAL.xml | grep uuid | cut -d "{" -f 2 | cut -d "}" -f 1`; do 
+				echo "- Cloning harddisk $HDUUID ..."
+				$SU "$VBM clonehd $HDUUID $VMDIR/$NAME/HD${HDDCOUNT}_$NAME.vdi > /dev/null"
+				if [ $? -ne 0 ]; then
+					echo "Error cloning harddisk with UUID $HDUUID to new path $VMDIR/$NAME/$NAME.vdi - bailing out..."
+					exit 1
+				fi
+				echo "- Attaching cloned harddisk to VM..."
+				NEWHDUUID=`$SU "$VBM list hdds | grep -B 3 $VMDIR/$NAME/HD${HDDCOUNT}_$NAME.vdi | head -1 | rev | cut -d ' ' -f 1 | rev"`
+				if [ $? -ne 0 ]; then
+					echo "Unable to find UUID of recently cloned disk, bailing out..."
+					exit 1
+				fi
+				$SU "$VBM storageattach $UUID --storagectl SATACTL --port 0 --device $HDDCOUNT --type hdd --medium $VMDIR/$NAME/HD${HDDCOUNT}_$NAME.vdi > /dev/null"
+				#increase counter for the next HD
+				HDDCOUNT=`expr $HDDCOUNT + 1`
+			done
+		fi
+		
+		echo "- Adding DVD drive, and mounting ISO if requested..."
+		if [ ! $ISOPATH = "none" ]; then
+			$SU "$VBM storageattach $UUID --storagectl IDECTL --port 0 --device 0 --type dvddrive --medium $ISOPATH > /dev/null"
+			if [ $? -ne 0 ]; then
+				echo "Error attaching DVD drive to VM, bailing out..."
+				exit 1
+			fi
+		fi
+
+		if [ $NICVLAN ]; then
+			echo "- Adding a Intel NIC bridged to $NICVLAN ..."
+			$SU "$VBM modifyvm $UUID --nic1 bridged --nictype1 82545EM --bridgeadapter1 $NICVLAN > /dev/null"
+			if [ $? -ne 0 ]; then
+				echo "Error adding NIC for VM, bailing out..."
+				exit 1
+			fi
+		else
+			if [ $VLANNUMBER -ne 0 ]; then 
+				echo "Invalid VLAN selected, not configuring a NIC for this VM."
+			fi
+		fi
+
+		echo "- Setting the OS type of the VM ..."
+		$SU "$VBM modifyvm $UUID --ostype $VOSTYPE > /dev/null"
+		if [ $? -ne 0 ]; then
+			echo "Error setting VM OS type, bailing out..."
+			exit 1
+		fi
+
+		if [ $OS64BIT ]; then
+			echo "- Enabling IO APIC on the VM since this is a 64bit OS..."
+			$SU "$VBM modifyvm $UUID --ioapic on > /dev/null"
+			if [ $? -ne 0 ]; then
+				echo "Error enabling IO APIC, bailing out..."
+				exit 1
+			fi
+		fi
+		echo
+		echo "Finished creating VM."
+		$LOGGER "Finished creating VM name: $NAME"
+	;;
+
+
+	list)
+		#list virtual machines
+		$SU "$VBM list vms | cut -d ' ' -f 1" > /tmp/allvms
+		$SU "$VBM list runningvms | cut -d ' ' -f 1" > /tmp/runningvms
+
+		echo "Powered off virtual machines:"
+		for vm in `cat /tmp/allvms`; do
+				grep $vm /tmp/runningvms > /dev/null
+				if [ $? -ne 0 ]; then
+						echo $vm | sed "s/\"//g"
+				fi
+		done
+
+		echo ""
+		echo "Running virtual machines:"
+		cat /tmp/runningvms | sed "s/\"//g"
+		echo ""
+		rm /tmp/allvms
+		rm /tmp/runningvms
+	;;
+
+
+	noiso|nocd)
+		#remove any mounted ISO from dvd drive in primary slave slot
+
+		#check if the VM is running
+		RUNNING=`isrunning $NAME`
+		if [ "$RUNNING" = "yes" ]; then
+			echo "The VM with the name $NAME is running. Stop it before changing mount options, with the command:"
+			echo "`basename $0` stop $NAME"
+			exit 1
+		fi
+		
+		$LOGGER "Unmounting ISO from VM: $NAME"
+		#remove any mounted ISO from dvd drive in primary master slot of the IDE controller
+		$SU "$VBM storageattach $NAME --storagectl IDECTL --port 0 --device 0 --medium none --type dvddrive > /dev/null"
+		if [ $? -ne 0 ]; then
+			echo "Error unmounting iso image, bailing out..."
+			exit 1
+		fi
+		$LOGGER "Unmounted ISO from VM: $NAME"
+	;;
+		
+	delete)
+		#find the UUID
+		UUID=`getuuid $NAME`
+		if [ ! $UUID ]; then
+			echo "Unable to find UUID of VM with the name $NAME, bailing out."
+			exit 1
+		fi
+
+		#check if the VM is running
+		RUNNING=`isrunning $NAME`
+		if [ "$RUNNING" = "yes" ]; then
+			echo "The VM with the name $NAME is running. Stop it before deleting it, with the command:"
+			echo "`basename $0` stop $NAME"
+			exit 1
+		fi
+		
+		$LOGGER "Deleting VM: $NAME"
+		
+		#find mounted media
+		for line in `$SU "$VBM showvminfo $UUID" | grep '(UUID: ' | sed 's/ /;/g' | cut -d ';' -f 1,2-3,6 | sed 's/;/ /g;s/)//;s/(//;s/ /,/;s/ //g;s/:/,/;s/)//g'`; do
+			MEDIACTL=`echo $line | cut -d "," -f 1`
+			MEDIAPORT=`echo $line | cut -d "," -f 2`
+			MEDIADEVICE=`echo $line | cut -d "," -f 3`
+			MEDIAUUID=`echo $line | cut -d "," -f 4 | sed "s/)//"`
+			echo "- Unmounting media with UUID $MEDIAUUID on controller $MEDIACTL port $MEDIAPORT device $MEDIADEVICE ... "
+			#check if this is a harddisk...
+			$SU "$VBM list hdds | grep $MEDIAUUID > /dev/null"
+			if [ $? -eq 1 ]; then
+				#echo "this is not a harddisk, just unmount it"
+				$SU "$VBM storageattach $UUID --storagectl $MEDIACTL --port $MEDIAPORT --device $MEDIADEVICE --type dvddrive --medium none > /dev/null"
+				if [ $? -ne 0 ]; then
+					echo "Error unmounting media, bailing out..."
+					exit 1
+				fi
+			else
+				#this is a harddisk, ask if it should be deleted
+				HDPATH=`$SU "$VBM showvminfo $UUID | grep $MEDIAUUID | sed 's/ /;/g' | cut -d ';' -f 4 | sed 's/;/ /g'"`
+				echo -n "Do you want to delete the harddisk image $HDPATH ? [y/n] "
+				read ANSWER
+				if [ $ANSWER -a $ANSWER = "y" ]; then
+					echo "Unmounting and deleting harddisk image $HDPATH ..."
+					$SU "$VBM storageattach $UUID --storagectl $MEDIACTL --port $MEDIAPORT --device $MEDIADEVICE --medium none > /dev/null"
+					if [ $? -ne 0 ]; then
+						echo "Error unmounting the harddisk image, bailing out..."
+						exit 1
+					fi
+					$SU "$VBM closemedium disk $MEDIAUUID --delete > /dev/null"
+					if [ $? -ne 0 ]; then
+						echo "Error unmounting and deleting harddisk image, bailing out..."
+						exit 1
+					fi
+				else
+					echo "Not deleting harddisk image $HDPATH - just umounting it."
+					$SU "$VBM storageattach $UUID --storagectl $MEDIACTL --port $MEDIAPORT --device $MEDIADEVICE --medium none > /dev/null"
+					if [ $? -ne 0 ]; then
+						echo "Error unmounting the harddisk image, bailing out..."
+						exit 1
+					fi
+					$SU "$VBM closemedium disk $MEDIAUUID > /dev/null"
+					if [ $? -ne 0 ]; then
+						echo "Error unmounting harddisk image, bailing out..."
+						exit 1
+					fi
+				fi
+			fi
+		done
+
+		#done umounting media, ask if the machine configs should be deleted
+		echo -n "Delete the configs of the VM named $NAME (UUID: $UUID) ? [y/n] "
+		read ANSWER
+		if [ $ANSWER -a $ANSWER = "y" ]; then
+			echo "Unregistering and deleting the VM ..."
+			$SU "$VBM unregistervm $UUID --delete > /dev/null"
+			if [ $? -ne 0 ]; then
+				echo "Error unregistering and deleting the VM, bailing out..."
+				exit 1
+			fi
+		else
+			echo "Unregistering (but not deleting) the VM ..."
+			$SU "$VBM unregistervm $UUID > /dev/null"
+			if [ $? -ne 0 ]; then
+				echo "Error unregistering the VM, bailing out..."
+				exit 1
+			fi
+		fi
+		
+		#check if this server is ZFS enabled
+		zfs list > /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+			#zfs enabled server, check datasets to see if there is a seperate dataset for this VM
+			DATASET=`zfs list | grep " $VMDIR/$NAME\$" | cut -d " " -f 1`
+			if [ $DATASET ]; then
+				echo "$VMDIR/$NAME is a ZFS dataset. Press enter to destroy the ZFS dataset that used to contain this VM."
+				read tyktemp
+				zfs destroy $DATASET
+				echo "Done."
+			fi
+		fi
+		echo "Finished deleting the VM $NAME"
+		$LOGGER "Finished deleting the VM $NAME"
+	;;
+
+	start)
+		#check if the VM is running
+		RUNNING=`isrunning $NAME`
+		if [ "$RUNNING" = "yes" ]; then
+			echo "The VM with the name $NAME is already running."
+			exit 1
+		fi
+
+		#find the VNC port
+		PORT=`echo $NAME | rev | cut -d "_" -f 1 | rev`
+		#create the Logs folder if it doesn't exist
+		if [ ! -d $VMDIR/$NAME/Logs ]; then
+			$SU "mkdir $VMDIR/$NAME/Logs"
+		fi
+		echo "Starting the machine with the name $NAME with a VNC console on port $PORT ..."
+		$LOGGER "Starting $NAME with VNC console on port $PORT ..."
+		$SU "$VBH --startvm $NAME --vnc --vncport $PORT --vncaddress $VNCIP" > $VMDIR/$NAME/Logs/vnc.log 2>&1 &
+		if [ $? -ne 0 ]; then
+			echo "Error starting the VM, bailing out..."
+			exit 1
+		fi
+		$LOGGER "Started the VM $NAME OK"
+	;;
+
+
+	stop)
+		#check if the VM is running
+		RUNNING=`isrunning $NAME`
+		if [ "$RUNNING" = "no" ]; then
+			echo "The VM with the name $NAME is not running."
+			exit 1
+		fi
+		$LOGGER "Stopping the VM $NAME ..."
+		echo "Stopping the machine with the name $NAME ..."
+		$SU "$VBM controlvm $NAME acpipowerbutton"
+		if [ $? -ne 0 ]; then
+			echo "Error stopping the VM, bailing out..."
+			exit 1
+		fi
+		$LOGGER "Finished stopping the VM $NAME"
+	;;
+
+
+	kill)
+		#check if the VM is running
+		RUNNING=`isrunning $NAME`
+		if [ "$RUNNING" = "no" ]; then
+			echo "The VM with the name $NAME is not running."
+			exit 1
+		fi
+		$LOGGER "Killing the VM $NAME ..."
+		echo "Killing the machine with the name $NAME ..."
+		$SU "$VBM controlvm $NAME poweroff"
+		if [ $? -ne 0 ]; then
+			echo "Error killing the VM, bailing out..."
+			exit 1
+		fi
+		$LOGGER "Finished killing the VM $NAME"
+	;;
+
+	info)
+		#display VM information
+		$SU "$VBM showvminfo $NAME | egrep '(^Name:|^Guest OS:|^UUID:|^Config file:|^Hardware UUID:|^Memory size:|^Storage Controller|.vdi \(|.iso \(|^NIC )' | grep -v disabled"
+		if [ $? -ne 0 ]; then
+			echo "Error showing info for the VM $NAME - bailing out..."
+			exit 1
+		fi
+	;;
+
+
+	help)
+		help
+	;;
+
+
+	*)
+		echo "Unknown option."
+		usage
+		exit 1
+	;;
+esac
